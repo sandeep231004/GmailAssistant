@@ -15,8 +15,11 @@ from ...models import GmailConnectPayload, GmailDisconnectPayload, GmailStatusPa
 from ...utils import error_response
 
 
-_CLIENT_LOCK = threading.Lock()
-_CLIENT: Optional[Any] = None
+_CLIENTS_LOCK = threading.Lock()
+_CLIENTS: Dict[str, Any] = {}
+
+_USER_API_KEYS: Dict[str, str] = {}
+_USER_API_KEYS_LOCK = threading.Lock()
 
 _PROFILE_CACHE: Dict[str, Dict[str, Any]] = {}
 _PROFILE_CACHE_LOCK = threading.Lock()
@@ -47,31 +50,74 @@ def get_active_gmail_user_id() -> Optional[str]:
         return _ACTIVE_USER_ID
 
 
+def _set_user_api_key(user_id: Optional[str], api_key: Optional[str]) -> None:
+    sanitized_user = _normalized(user_id)
+    sanitized_key = _normalized(api_key)
+    if not sanitized_user or not sanitized_key:
+        return
+    with _USER_API_KEYS_LOCK:
+        _USER_API_KEYS[sanitized_user] = sanitized_key
+
+
+def _get_user_api_key(user_id: Optional[str]) -> Optional[str]:
+    sanitized_user = _normalized(user_id)
+    if not sanitized_user:
+        return None
+    with _USER_API_KEYS_LOCK:
+        return _USER_API_KEYS.get(sanitized_user)
+
+
+def _clear_user_api_key(user_id: Optional[str] = None) -> None:
+    if user_id:
+        sanitized_user = _normalized(user_id)
+        if not sanitized_user:
+            return
+        with _USER_API_KEYS_LOCK:
+            _USER_API_KEYS.pop(sanitized_user, None)
+    else:
+        with _USER_API_KEYS_LOCK:
+            _USER_API_KEYS.clear()
+
+
 def _gmail_import_client():
     from composio import Composio  # type: ignore
     return Composio
 
 
-# Get or create a singleton Composio client instance with thread-safe initialization
-def _get_composio_client(settings: Optional[Settings] = None):
-    global _CLIENT
-    if _CLIENT is not None:
-        return _CLIENT
+# Get or create a cached Composio client instance (keyed by API key).
+def _get_composio_client(
+    settings: Optional[Settings] = None,
+    *,
+    api_key: Optional[str] = None,
+    user_id: Optional[str] = None,
+):
+    resolved_settings = settings or get_settings()
+    resolved_api_key = _normalized(api_key)
+    if not resolved_api_key and user_id:
+        resolved_api_key = _normalized(_get_user_api_key(user_id))
+    if not resolved_api_key:
+        resolved_api_key = _normalized(resolved_settings.composio_api_key)
 
-    with _CLIENT_LOCK:
-        if _CLIENT is None:
-            resolved_settings = settings or get_settings()
-            Composio = _gmail_import_client()
-            api_key = resolved_settings.composio_api_key
-            try:
-                _CLIENT = Composio(api_key=api_key) if api_key else Composio()
-            except TypeError as exc:
-                if api_key:
-                    raise RuntimeError(
-                        "Installed Composio SDK does not accept the api_key argument; upgrade the SDK or remove COMPOSIO_API_KEY."
-                    ) from exc
-                _CLIENT = Composio()
-    return _CLIENT
+    cache_key = resolved_api_key or "__no_key__"
+    client = _CLIENTS.get(cache_key)
+    if client is not None:
+        return client
+
+    with _CLIENTS_LOCK:
+        client = _CLIENTS.get(cache_key)
+        if client is not None:
+            return client
+        Composio = _gmail_import_client()
+        try:
+            client = Composio(api_key=resolved_api_key) if resolved_api_key else Composio()
+        except TypeError as exc:
+            if resolved_api_key:
+                raise RuntimeError(
+                    "Installed Composio SDK does not accept the api_key argument; upgrade the SDK or remove the api_key."
+                ) from exc
+            client = Composio()
+        _CLIENTS[cache_key] = client
+        return client
 
 
 def _extract_email(obj: Any) -> Optional[str]:
@@ -218,19 +264,27 @@ def _fetch_profile_from_composio(user_id: Optional[str]) -> Optional[Dict[str, A
 
 # Start Gmail OAuth connection process and return redirect URL
 def initiate_connect(payload: GmailConnectPayload, settings: Settings) -> JSONResponse:
-    auth_config_id = payload.auth_config_id or settings.composio_gmail_auth_config_id or ""
+    auth_config_id = _normalized(payload.auth_config_id)
     if not auth_config_id:
         return error_response(
-            "Missing auth_config_id. Set COMPOSIO_GMAIL_AUTH_CONFIG_ID or pass auth_config_id.",
+            "Missing auth_config_id. Provide auth_config_id from the UI.",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
-    user_id = payload.user_id or f"web-{os.getpid()}"
+    api_key = _normalized(payload.composio_api_key)
+    if not api_key:
+        return error_response(
+            "Missing composio_api_key. Provide composio_api_key from the UI.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    user_id = _normalized(payload.user_id) or f"web-{os.getpid()}"
     allow_multiple = bool(payload.allow_multiple) if payload.allow_multiple is not None else False
     _set_active_gmail_user_id(user_id)
+    _set_user_api_key(user_id, api_key)
     _clear_cached_profile(user_id)
     try:
-        client = _get_composio_client(settings)
+        client = _get_composio_client(settings, api_key=api_key, user_id=user_id)
         if allow_multiple:
             try:
                 req = client.connected_accounts.initiate(
@@ -269,6 +323,7 @@ def initiate_connect(payload: GmailConnectPayload, settings: Settings) -> JSONRe
 def fetch_status(payload: GmailStatusPayload) -> JSONResponse:
     connection_request_id = _normalized(payload.connection_request_id)
     user_id = _normalized(payload.user_id)
+    payload_api_key = _normalized(payload.composio_api_key)
 
     if not connection_request_id and not user_id:
         return error_response(
@@ -277,7 +332,8 @@ def fetch_status(payload: GmailStatusPayload) -> JSONResponse:
         )
 
     try:
-        client = _get_composio_client()
+        api_key = payload_api_key or _get_user_api_key(user_id)
+        client = _get_composio_client(api_key=api_key, user_id=user_id)
         account: Any = None
         if connection_request_id:
             try:
@@ -318,6 +374,8 @@ def fetch_status(payload: GmailStatusPayload) -> JSONResponse:
 
         if not user_id and account_user_id:
             user_id = _normalized(account_user_id)
+        if user_id and payload_api_key:
+            _set_user_api_key(user_id, payload_api_key)
 
         if connected and user_id:
             cached_profile = _get_cached_profile(user_id)
@@ -368,6 +426,7 @@ def fetch_status(payload: GmailStatusPayload) -> JSONResponse:
 def disconnect_account(payload: GmailDisconnectPayload) -> JSONResponse:
     connection_id = _normalized(payload.connection_id) or _normalized(payload.connection_request_id)
     user_id = _normalized(payload.user_id)
+    payload_api_key = _normalized(payload.composio_api_key)
 
     if not connection_id and not user_id:
         return error_response(
@@ -376,7 +435,8 @@ def disconnect_account(payload: GmailDisconnectPayload) -> JSONResponse:
         )
 
     try:
-        client = _get_composio_client()
+        api_key = payload_api_key or _get_user_api_key(user_id)
+        client = _get_composio_client(api_key=api_key, user_id=user_id)
     except Exception as exc:
         logger.exception("gmail disconnect failed: client init", extra={"user_id": user_id})
         return error_response(
@@ -446,6 +506,7 @@ def disconnect_account(payload: GmailDisconnectPayload) -> JSONResponse:
     for uid in list(affected_user_ids):
         if uid:
             _clear_cached_profile(uid)
+            _clear_user_api_key(uid)
             if get_active_gmail_user_id() == uid:
                 _set_active_gmail_user_id(None)
 
@@ -534,7 +595,8 @@ def execute_gmail_tool(
     prepared_arguments.setdefault("user_id", "me")
 
     try:
-        client = _get_composio_client()
+        api_key = _get_user_api_key(composio_user_id)
+        client = _get_composio_client(api_key=api_key, user_id=composio_user_id)
         result = client.client.tools.execute(
             tool_name,
             user_id=composio_user_id,

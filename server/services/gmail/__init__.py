@@ -8,6 +8,7 @@ from .client import (
     initiate_connect,
     set_active_gmail_user_id,
 )
+from .draft_store import clear_latest_draft, get_latest_draft, set_latest_draft
 from .importance_classifier import classify_email_importance
 from .importance_watcher import ImportantEmailWatcher, get_important_email_watcher
 from .processing import EmailTextCleaner, ProcessedEmail, parse_gmail_fetch_response
@@ -20,6 +21,9 @@ __all__ = [
     "disconnect_account",
     "get_active_gmail_user_id",
     "set_active_gmail_user_id",
+    "set_latest_draft",
+    "get_latest_draft",
+    "clear_latest_draft",
     "classify_email_importance",
     "ImportantEmailWatcher",
     "get_important_email_watcher",

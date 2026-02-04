@@ -27,7 +27,7 @@ def _resolve_interaction_runtime() -> "InteractionAgentRuntime":
 
 DEFAULT_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_LOOKBACK_MINUTES = 10
-DEFAULT_MAX_RESULTS = 50
+DEFAULT_MAX_RESULTS = 10
 DEFAULT_SEEN_LIMIT = 300
 
 
@@ -116,9 +116,10 @@ class ImportantEmailWatcher:
             return
 
         query = f"label:INBOX newer_than:{self._lookback_minutes}m"
+        include_payload = not first_poll
         arguments = {
             "query": query,
-            "include_payload": True,
+            "include_payload": include_payload,
             "max_results": DEFAULT_MAX_RESULTS,
         }
 

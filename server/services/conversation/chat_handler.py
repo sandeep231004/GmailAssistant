@@ -8,6 +8,7 @@ from ...agents.interaction_agent.runtime import InteractionAgentRuntime
 from ...logging_config import logger
 from ...models import ChatMessage, ChatRequest
 from ...services.gmail import set_active_gmail_user_id
+from ...services.user_profile import set_active_user_name
 from ...utils import error_response
 
 
@@ -32,8 +33,17 @@ async def handle_chat_request(payload: ChatRequest) -> Union[PlainTextResponse, 
 
     if payload.user_id:
         set_active_gmail_user_id(payload.user_id)
+    if payload.user_name or payload.user_id:
+        set_active_user_name(payload.user_id, payload.user_name)
 
-    logger.info("chat request", extra={"message_length": len(user_content)})
+    logger.info(
+        "chat request",
+        extra={
+            "message_length": len(user_content),
+            "has_user_id": bool(payload.user_id),
+            "has_user_name": bool(payload.user_name),
+        },
+    )
 
     try:
         runtime = InteractionAgentRuntime()

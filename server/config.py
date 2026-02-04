@@ -51,21 +51,35 @@ class Settings(BaseModel):
     server_port: int = Field(default=_env_int("GMAILASSISTANT_PORT", 8001))
 
     # LLM model selection
-    interaction_agent_model: str = Field(default="gemini-2.0-flash")
-    execution_agent_model: str = Field(default="gemini-2.0-flash")
-    execution_agent_search_model: str = Field(default="gemini-2.0-flash")
-    summarizer_model: str = Field(default="gemini-2.0-flash")
-    email_classifier_model: str = Field(default="gemini-2.0-flash")
+    interaction_agent_model: str = Field(
+        default=os.getenv("GMAILASSISTANT_INTERACTION_MODEL", "gemini-2.0-flash")
+    )
+    execution_agent_model: str = Field(
+        default=os.getenv("GMAILASSISTANT_EXECUTION_MODEL", "gemini-2.0-flash")
+    )
+    execution_agent_search_model: str = Field(
+        default=os.getenv("GMAILASSISTANT_EXECUTION_SEARCH_MODEL", "gemini-2.0-flash")
+    )
+    summarizer_model: str = Field(
+        default=os.getenv("GMAILASSISTANT_SUMMARIZER_MODEL", "gemini-2.0-flash")
+    )
+    email_classifier_model: str = Field(
+        default=os.getenv("GMAILASSISTANT_EMAIL_CLASSIFIER_MODEL", "gemini-2.0-flash")
+    )
 
     # Gemini API configuration (OpenAI-compatible endpoint)
     gemini_api_key: Optional[str] = Field(
-        default=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        default=os.getenv("GROQ_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
     )
     gemini_base_url: str = Field(
-        default=os.getenv(
-            "GEMINI_BASE_URL",
-            "https://generativelanguage.googleapis.com/v1beta/openai/",
+        default=(
+            os.getenv("GROQ_BASE_URL")
+            if os.getenv("GROQ_API_KEY")
+            else os.getenv("GEMINI_BASE_URL")
         )
+        or "https://generativelanguage.googleapis.com/v1beta/openai/"
     )
 
     # Credentials / integrations
@@ -76,6 +90,7 @@ class Settings(BaseModel):
     cors_allow_origins_raw: str = Field(default=os.getenv("GMAILASSISTANT_CORS_ALLOW_ORIGINS", "*"))
     enable_docs: bool = Field(default=os.getenv("GMAILASSISTANT_ENABLE_DOCS", "1") != "0")
     docs_url: Optional[str] = Field(default=os.getenv("GMAILASSISTANT_DOCS_URL", "/docs"))
+    llm_timeout_seconds: int = Field(default=_env_int("GMAILASSISTANT_LLM_TIMEOUT_SECONDS", 60))
 
     # Summarisation controls
     conversation_summary_threshold: int = Field(default=_env_int("GMAILASSISTANT_SUMMARY_THRESHOLD", 100))

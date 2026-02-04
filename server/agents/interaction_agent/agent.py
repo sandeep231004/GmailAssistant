@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Dict, List
 
 from ...services.execution import get_agent_roster
+from ...services.gmail import get_active_gmail_user_id
+from ...services.user_profile import get_active_user_name
 
 _prompt_path = Path(__file__).parent / "system_prompt.md"
 SYSTEM_PROMPT = _prompt_path.read_text(encoding="utf-8").strip()
@@ -26,6 +28,7 @@ def prepare_message_with_history(
     sections: List[str] = []
 
     sections.append(_render_conversation_history(transcript))
+    sections.append(_render_user_profile())
     sections.append(f"<active_agents>\n{_render_active_agents()}\n</active_agents>")
     sections.append(_render_current_turn(latest_text, message_type))
 
@@ -56,6 +59,19 @@ def _render_active_agents() -> str:
         rendered.append(f'<agent name="{name}" />')
 
     return "\n".join(rendered)
+
+
+def _render_user_profile() -> str:
+    user_id = get_active_gmail_user_id()
+    user_name = get_active_user_name(user_id)
+    if not user_id and not user_name:
+        return "<user_profile>None</user_profile>"
+    parts: List[str] = []
+    if user_name:
+        parts.append(f"Name: {user_name}")
+    if user_id:
+        parts.append(f"User ID: {user_id}")
+    return "<user_profile>\n" + "\n".join(parts) + "\n</user_profile>"
 
 
 # Wrap the current message in appropriate XML tags based on sender type

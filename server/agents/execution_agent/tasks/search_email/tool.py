@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from server.config import get_settings
@@ -50,7 +51,7 @@ _EMAIL_CLEANER = EmailTextCleaner(max_url_length=40)
 def _create_error_response(call_id: str, query: Optional[str], error: str) -> Tuple[str, str]:
     """Create standardized error response for tool calls."""
     result = EmailSearchToolResult(status="error", query=query, error=error)
-    return (call_id, _safe_json_dumps(result.model_dump(exclude_none=True)))
+    return (call_id, _safe_json_dumps(result.model_dump(exclude_none=True, mode="json")))
 
 
 # Create standardized success response for tool calls
@@ -139,6 +140,7 @@ async def _run_email_search(
     queries: List[str] = []
     emails: Dict[str, GmailSearchEmail] = {}
     selected_ids: Optional[List[str]] = None
+    completion_called = False
     
     for iteration in range(MAX_LLM_ITERATIONS):
         logger.debug(
@@ -171,7 +173,6 @@ async def _run_email_search(
         # Handle case where LLM doesn't make tool calls
         if not tool_calls:
             logger.info(f"[EMAIL_SEARCH] LLM completed search - no more queries needed")
-            selected_ids = []
             break
         
         # Execute tool calls and process responses
@@ -193,12 +194,21 @@ async def _run_email_search(
         # Check if search is complete
         if completed_ids is not None:
             logger.info(f"[EMAIL_SEARCH] Search completed - selected {len(completed_ids)} emails")
+            completion_called = True
             selected_ids = completed_ids
             break
     else:
         logger.error(f"[EMAIL_SEARCH] {ERROR_ITERATION_LIMIT}")
         raise RuntimeError(ERROR_ITERATION_LIMIT)
     
+    if not completion_called and selected_ids is None and emails:
+        fallback_ids = _select_fallback_emails(emails, limit=5)
+        logger.info(
+            "[EMAIL_SEARCH] No completion tool call; falling back to most recent emails",
+            extra={"selected": len(fallback_ids)},
+        )
+        selected_ids = fallback_ids
+
     final_result = _build_response(queries, emails, selected_ids or [])
     unique_queries = list(dict.fromkeys(queries))
     logger.info(f"[EMAIL_SEARCH] Completed - {len(unique_queries)} queries executed, {len(final_result)} emails selected")
@@ -257,7 +267,7 @@ async def _execute_tool_calls(
                 emails=emails,
                 composio_user_id=composio_user_id,
             )
-            response_data = result_model.model_dump(exclude_none=True)
+            response_data = result_model.model_dump(exclude_none=True, mode="json")
             
             if result_model.status == "success":
                 count = result_model.result_count or 0
@@ -358,10 +368,29 @@ def _build_response(
     # Deduplicate and filter valid email IDs efficiently
     valid_ids = [id.strip() for id in selected_ids if id and id.strip()]
     unique_ids = list(dict.fromkeys(valid_ids))
-    selected_emails = [emails[id] for id in unique_ids if id in emails]
+    emails_by_thread: Dict[str, GmailSearchEmail] = {}
+    for email in emails.values():
+        if not email.thread_id:
+            continue
+        current = emails_by_thread.get(email.thread_id)
+        if current is None or email.timestamp > current.timestamp:
+            emails_by_thread[email.thread_id] = email
+
+    selected_emails: List[GmailSearchEmail] = []
+    selected_email_ids: set[str] = set()
+    missing_ids: List[str] = []
+
+    for item_id in unique_ids:
+        email = emails.get(item_id) or emails_by_thread.get(item_id)
+        if not email:
+            missing_ids.append(item_id)
+            continue
+        if email.id in selected_email_ids:
+            continue
+        selected_email_ids.add(email.id)
+        selected_emails.append(email)
     
     # Log any missing email IDs
-    missing_ids = [id for id in unique_ids if id not in emails]
     if missing_ids:
         logger.warning(f"[EMAIL_SEARCH] {len(missing_ids)} selected email IDs not found")
     
@@ -375,7 +404,7 @@ def _build_response(
         ),
     )
     
-    return [email.model_dump(exclude_none=True) for email in payload.emails]
+    return [email.model_dump(exclude_none=True, mode="json") for email in payload.emails]
 
 
 def _extract_assistant_message(response: Dict[str, Any]) -> Dict[str, Any]:
@@ -415,7 +444,7 @@ def _handle_completion_tool(arguments: Dict[str, Any]) -> Tuple[Optional[List[st
 def _safe_json_dumps(payload: Any) -> str:
     """Safely serialize payload to JSON string."""
     try:
-        return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(payload, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return json.dumps({"repr": repr(payload)})
 
@@ -440,6 +469,23 @@ def _processed_to_schema(email: ProcessedEmail) -> GmailSearchEmail:
         attachment_count=email.attachment_count,
         attachment_filenames=list(email.attachment_filenames),
     )
+
+
+def _select_fallback_emails(
+    emails: Dict[str, GmailSearchEmail],
+    *,
+    limit: int = 5,
+) -> List[str]:
+    """Select a small set of recent emails when the LLM does not return results."""
+    if limit <= 0:
+        return []
+
+    sorted_emails = sorted(
+        emails.values(),
+        key=lambda item: item.timestamp or datetime.min,
+        reverse=True,
+    )
+    return [email.id for email in sorted_emails[:limit]]
 
 
 __all__ = [

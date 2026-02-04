@@ -20,6 +20,7 @@ from .gmail import (
     get_important_email_watcher,
     initiate_connect,
 )
+from .user_profile import get_active_user_name, set_active_user_name
 from .timezone_store import TimezoneStore, get_timezone_store
 
 
@@ -43,6 +44,8 @@ __all__ = [
     "get_active_gmail_user_id",
     "get_important_email_watcher",
     "initiate_connect",
+    "get_active_user_name",
+    "set_active_user_name",
     "TimezoneStore",
     "get_timezone_store",
 ]

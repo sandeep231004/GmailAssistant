@@ -1,3 +1,3 @@
-﻿from .client import GeminiError, request_chat_completion
+﻿from .client import GeminiError, is_local_llm_base_url, request_chat_completion
 
-__all__ = ["GeminiError", "request_chat_completion"]
+__all__ = ["GeminiError", "is_local_llm_base_url", "request_chat_completion"]

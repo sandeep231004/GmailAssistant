@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 from .processing import ProcessedEmail
 from ...config import get_settings
 from ...logging_config import logger
-from ...gemini_client import GeminiError, request_chat_completion
+from ...gemini_client import GeminiError, is_local_llm_base_url, request_chat_completion
 
 
 _TOOL_NAME = "mark_email_importance"
@@ -84,7 +84,7 @@ async def classify_email_importance(email: ProcessedEmail) -> Optional[str]:
     api_key = settings.gemini_api_key
     model = settings.email_classifier_model
 
-    if not api_key:
+    if not api_key and not is_local_llm_base_url(settings.gemini_base_url):
         logger.warning("Skipping importance check; Gemini API key missing")
         return None
 

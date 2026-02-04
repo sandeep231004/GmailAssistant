@@ -2,13 +2,14 @@
 
 import json
 from dataclasses import dataclass, field
+import re
 from typing import Any, Dict, List, Optional, Set
 
 from .agent import build_system_prompt, prepare_message_with_history
 from .tools import ToolResult, get_tool_schemas, handle_tool_call
 from ...config import get_settings
 from ...services.conversation import get_conversation_log, get_working_memory_log
-from ...gemini_client import request_chat_completion
+from ...gemini_client import is_local_llm_base_url, request_chat_completion
 from ...logging_config import logger
 
 
@@ -56,10 +57,18 @@ class InteractionAgentRuntime:
         self.working_memory_log = get_working_memory_log()
         self.tool_schemas = get_tool_schemas()
 
-        if not self.api_key:
+        if not self.api_key and not is_local_llm_base_url(self.settings.gemini_base_url):
+            logger.error(
+                "Gemini API key missing",
+                extra={"env_vars_checked": ["GEMINI_API_KEY", "GOOGLE_API_KEY"]},
+            )
             raise ValueError(
                 "Gemini API key not configured. Set GEMINI_API_KEY environment variable."
             )
+        logger.info(
+            "Interaction agent initialized",
+            extra={"model": self.model, "api_key_configured": True},
+        )
 
     # Main entry point for processing user messages through the LLM interaction loop
     async def execute(self, user_message: str) -> InteractionResult:
@@ -89,7 +98,7 @@ class InteractionAgentRuntime:
             )
 
         except Exception as exc:
-            logger.error("Interaction agent failed", extra={"error": str(exc)})
+            logger.exception("Interaction agent failed: %s", exc)
             return InteractionResult(
                 success=False,
                 response="",
@@ -114,6 +123,13 @@ class InteractionAgentRuntime:
 
             final_response = self._finalize_response(summary)
 
+            if not final_response:
+                fallback = self._fallback_from_agent_message(agent_message)
+                if fallback:
+                    logger.info("Using fallback response for agent message")
+                    self.conversation_log.record_reply(fallback)
+                    final_response = fallback
+
             if final_response and not summary.user_messages:
                 self.conversation_log.record_reply(final_response)
 
@@ -124,10 +140,7 @@ class InteractionAgentRuntime:
             )
 
         except Exception as exc:
-            logger.exception(
-                "Interaction agent (agent message) failed",
-                extra={"error": str(exc)},
-            )
+            logger.exception("Interaction agent (agent message) failed: %s", exc)
             try:
                 self.conversation_log.record_reply(
                     "Something went wrong while processing the agent results. Please try again."
@@ -152,6 +165,7 @@ class InteractionAgentRuntime:
 
         for iteration in range(self.MAX_TOOL_ITERATIONS):
             response = await self._make_llm_call(system_prompt, messages)
+            self._log_llm_response(response, stage="interaction_loop", iteration=iteration + 1)
             assistant_message = self._extract_assistant_message(response)
 
             assistant_content = (assistant_message.get("content") or "").strip()
@@ -219,13 +233,22 @@ class InteractionAgentRuntime:
             "Interaction agent calling LLM",
             extra={"model": self.model, "tools": len(self.tool_schemas)},
         )
-        return await request_chat_completion(
-            model=self.model,
-            messages=messages,
-            system=system_prompt,
-            api_key=self.api_key,
-            tools=self.tool_schemas,
-        )
+        try:
+            return await request_chat_completion(
+                model=self.model,
+                messages=messages,
+                system=system_prompt,
+                api_key=self.api_key,
+                tools=self.tool_schemas,
+            )
+        except Exception as exc:
+            logger.exception(
+                "LLM call failed (model=%s, base_url=%s): %s",
+                self.model,
+                self.settings.gemini_base_url,
+                exc,
+            )
+            raise
 
     # Extract the assistant's message from the Gemini API response structure
     def _extract_assistant_message(self, response: Dict[str, Any]) -> Dict[str, Any]:
@@ -236,6 +259,29 @@ class InteractionAgentRuntime:
         if not isinstance(message, dict):
             raise RuntimeError("LLM response did not include an assistant message")
         return message
+
+    def _log_llm_response(
+        self,
+        response: Dict[str, Any],
+        *,
+        stage: str,
+        iteration: int,
+    ) -> None:
+        """Log basic LLM response details for debugging empty outputs."""
+        choice = (response.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls") or []
+        finish_reason = choice.get("finish_reason")
+
+        logger.info(
+            "LLM response meta (stage=%s, iteration=%s, content_length=%s, tool_calls=%s, finish_reason=%s)",
+            stage,
+            iteration,
+            len(content),
+            len(tool_calls),
+            finish_reason,
+        )
 
     # Convert raw LLM tool calls into structured _ToolCall objects with validation
     def _parse_tool_calls(self, raw_tool_calls: List[Dict[str, Any]]) -> List[_ToolCall]:
@@ -397,7 +443,10 @@ class InteractionAgentRuntime:
             log_payload.update(detail)
 
         if stage == "done":
-            logger.info(f"Tool '{tool_call.name}' completed")
+            if result is not None and not result.success:
+                logger.warning(f"Tool '{tool_call.name}' completed with error")
+            else:
+                logger.info(f"Tool '{tool_call.name}' completed")
         elif stage in {"error", "rejected"}:
             logger.warning(f"Tool '{tool_call.name}' {stage}")
         else:
@@ -411,3 +460,28 @@ class InteractionAgentRuntime:
             return summary.user_messages[-1]
 
         return summary.last_assistant_text
+
+    def _fallback_from_agent_message(self, agent_message: str) -> str:
+        """Extract a user-friendly reply from execution-agent results."""
+        if not agent_message:
+            return "I couldn't process that result. Please try again."
+
+        lines = []
+        for raw in agent_message.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            match = re.match(r"^\[(SUCCESS|FAILED)\]\s*[^:]+:\s*(.+)$", line)
+            if match:
+                lines.append(match.group(2).strip())
+                continue
+            match = re.match(r"^\[(SUCCESS|FAILED)\]\s*(.+)$", line)
+            if match:
+                lines.append(match.group(2).strip())
+                continue
+            lines.append(line)
+
+        cleaned = "\n".join(lines).strip()
+        if not cleaned:
+            return "I couldn't process that result. Please try again."
+        return cleaned

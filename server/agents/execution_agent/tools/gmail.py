@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 from server.services.execution import get_execution_agent_logs
-from server.services.gmail import execute_gmail_tool, get_active_gmail_user_id
+from server.services.gmail import (
+    clear_latest_draft,
+    execute_gmail_tool,
+    get_active_gmail_user_id,
+    set_latest_draft,
+)
+from server.services.user_profile import get_active_user_name
 
 _GMAIL_AGENT_NAME = "gmail-execution-agent"
 
@@ -314,6 +321,29 @@ _SCHEMAS: List[Dict[str, Any]] = [
 _LOG_STORE = get_execution_agent_logs()
 
 
+def _extract_draft_id(payload: Any) -> Optional[str]:
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        for key in ("draft_id", "draftId", "id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for container_key in ("data", "result", "response_data", "draft"):
+            nested = payload.get(container_key)
+            if isinstance(nested, dict):
+                found = _extract_draft_id(nested)
+                if found:
+                    return found
+        items = payload.get("items")
+        if isinstance(items, list) and items:
+            for entry in items:
+                found = _extract_draft_id(entry)
+                if found:
+                    return found
+    return None
+
+
 # Return Gmail tool schemas
 def get_schemas() -> List[Dict[str, Any]]:
     """Return Gmail tool schemas."""
@@ -355,6 +385,7 @@ def gmail_create_draft(
     thread_id: Optional[str] = None,
     attachment: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    body = _apply_default_signoff(body)
     arguments: Dict[str, Any] = {
         "recipient_email": recipient_email,
         "subject": subject,
@@ -369,7 +400,17 @@ def gmail_create_draft(
     composio_user_id = get_active_gmail_user_id()
     if not composio_user_id:
         return {"error": "Gmail not connected. Please connect Gmail in settings first."}
-    return _execute("GMAIL_CREATE_EMAIL_DRAFT", composio_user_id, arguments)
+    result = _execute("GMAIL_CREATE_EMAIL_DRAFT", composio_user_id, arguments)
+    draft_id = _extract_draft_id(result)
+    if draft_id:
+        set_latest_draft(
+            composio_user_id,
+            draft_id,
+            to=recipient_email,
+            subject=subject,
+            body=body,
+        )
+    return result
 
 
 # Send a previously created Gmail draft using Composio
@@ -380,7 +421,27 @@ def gmail_execute_draft(
     composio_user_id = get_active_gmail_user_id()
     if not composio_user_id:
         return {"error": "Gmail not connected. Please connect Gmail in settings first."}
-    return _execute("GMAIL_SEND_DRAFT", composio_user_id, arguments)
+    result = _execute("GMAIL_SEND_DRAFT", composio_user_id, arguments)
+    clear_latest_draft(composio_user_id)
+    return result
+
+
+def _apply_default_signoff(body: str) -> str:
+    user_name = get_active_user_name(get_active_gmail_user_id())
+    cleaned = (body or "").strip()
+    if not cleaned or not user_name:
+        return body
+
+    name_lower = user_name.lower()
+    tail = cleaned[-200:].lower()
+    if name_lower in tail:
+        return body
+
+    placeholder_pattern = re.compile(r"\[(your name)\]|\{your name\}|\(your name\)|<your name>", re.IGNORECASE)
+    if placeholder_pattern.search(cleaned):
+        return placeholder_pattern.sub(user_name, cleaned)
+
+    return f"{cleaned}\n\nBest,\n{user_name}"
 
 
 # Forward an existing Gmail message with optional additional context

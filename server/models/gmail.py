@@ -10,6 +10,7 @@ class GmailConnectPayload(BaseModel):
 
     user_id: Optional[str] = Field(default=None, alias="user_id")
     auth_config_id: Optional[str] = Field(default=None, alias="auth_config_id")
+    composio_api_key: Optional[str] = Field(default=None, alias="composio_api_key")
     allow_multiple: Optional[bool] = Field(default=None, alias="allow_multiple")
 
 
@@ -18,6 +19,7 @@ class GmailStatusPayload(BaseModel):
 
     user_id: Optional[str] = Field(default=None, alias="user_id")
     connection_request_id: Optional[str] = Field(default=None, alias="connection_request_id")
+    composio_api_key: Optional[str] = Field(default=None, alias="composio_api_key")
 
 
 class GmailDisconnectPayload(BaseModel):
@@ -26,3 +28,4 @@ class GmailDisconnectPayload(BaseModel):
     user_id: Optional[str] = Field(default=None, alias="user_id")
     connection_id: Optional[str] = Field(default=None, alias="connection_id")
     connection_request_id: Optional[str] = Field(default=None, alias="connection_request_id")
+    composio_api_key: Optional[str] = Field(default=None, alias="composio_api_key")

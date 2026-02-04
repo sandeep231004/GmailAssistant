@@ -96,7 +96,7 @@ class ConversationLog:
         self._append("agent_message", content)
 
     def record_reply(self, content: str) -> None:
-        self._append("poke_reply", content)
+        self._append("assistant_reply", content)
 
     def record_wait(self, reason: str) -> None:
         """Record a wait marker that should not reach the user-facing chat history."""
@@ -132,7 +132,7 @@ class ConversationLog:
                 messages.append(
                     ChatMessage(role="user", content=payload, timestamp=normalized_timestamp)
                 )
-            elif tag == "poke_reply":
+            elif tag in {"assistant_reply", "poke_reply"}:
                 messages.append(
                     ChatMessage(role="assistant", content=payload, timestamp=normalized_timestamp)
                 )

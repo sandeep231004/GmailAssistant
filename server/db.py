@@ -121,6 +121,15 @@ def ensure_schema() -> None:
                 )
                 conn.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        user_id TEXT PRIMARY KEY,
+                        user_name TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    """
+                )
+                conn.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_gmail_seen_seen_at
                     ON gmail_seen (seen_at);
                     """

@@ -5,7 +5,7 @@ from typing import List, Optional, TYPE_CHECKING
 
 from ....config import get_settings
 from ....logging_config import logger
-from ....gemini_client import GeminiError, request_chat_completion
+from ....gemini_client import GeminiError, is_local_llm_base_url, request_chat_completion
 from .prompt_builder import SummaryPrompt, build_summarization_prompt
 from .state import LogEntry, SummaryState
 from .working_memory_log import get_working_memory_log
@@ -76,7 +76,7 @@ async def summarize_conversation() -> bool:
     settings = get_settings()
     if not settings.summarization_enabled:
         return False
-    if not settings.gemini_api_key:
+    if not settings.gemini_api_key and not is_local_llm_base_url(settings.gemini_base_url):
         logger.warning("Skipping summarization; Gemini API key missing")
         return False
 

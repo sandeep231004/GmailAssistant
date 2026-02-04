@@ -9,20 +9,29 @@ from ..config import get_settings
 
 
 class GeminiError(RuntimeError):
-    """Raised when the Gemini API returns an error response."""
+    """Raised when the LLM API returns an error response."""
 
 
-def _headers(*, api_key: Optional[str] = None) -> Dict[str, str]:
+def is_local_llm_base_url(base_url: Optional[str] = None) -> bool:
     settings = get_settings()
+    resolved_base = (base_url or settings.gemini_base_url or "").lower()
+    return "localhost:11434" in resolved_base or "127.0.0.1:11434" in resolved_base
+
+
+def _headers(*, api_key: Optional[str] = None, base_url: Optional[str] = None) -> Dict[str, str]:
+    settings = get_settings()
+    resolved_base = (base_url or settings.gemini_base_url or "").lower()
     key = (api_key or settings.gemini_api_key or "").strip()
-    if not key:
+    if not key and not is_local_llm_base_url(resolved_base):
         raise GeminiError("Missing Gemini API key")
 
-    return {
-        "Authorization": f"Bearer {key}",
+    headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
 def _build_messages(messages: List[Dict[str, str]], system: Optional[str]) -> List[Dict[str, str]]:
@@ -65,13 +74,17 @@ async def request_chat_completion(
     resolved_base = (base_url or settings.gemini_base_url).rstrip("/")
     url = f"{resolved_base}/chat/completions"
 
+    timeout_seconds = settings.llm_timeout_seconds
+    if timeout_seconds <= 0:
+        timeout_seconds = 60
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
                 url,
-                headers=_headers(api_key=api_key),
+                headers=_headers(api_key=api_key, base_url=resolved_base),
                 json=payload,
-                timeout=60.0,
+                timeout=timeout_seconds,
             )
             try:
                 response.raise_for_status()

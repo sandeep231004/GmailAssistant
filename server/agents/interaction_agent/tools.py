@@ -2,11 +2,20 @@
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from ...logging_config import logger
 from ...services.conversation import get_conversation_log
+from ...services.gmail import (
+    clear_latest_draft,
+    execute_gmail_tool,
+    get_active_gmail_user_id,
+    get_latest_draft,
+    set_latest_draft,
+)
+from ...services.user_profile import get_active_user_name
 from ...services.execution import get_agent_roster, get_execution_agent_logs
 from ..execution_agent.batch_manager import ExecutionBatchManager
 
@@ -88,6 +97,18 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "send_latest_draft",
+            "description": "Send the most recent Gmail draft after the user confirms.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "wait",
             "description": "Wait silently when a message is already in conversation history to avoid duplicating responses. Adds a <wait> log entry that is not visible to the user.",
             "parameters": {
@@ -118,6 +139,22 @@ def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
 
     if is_new:
         roster.add_agent(agent_name)
+
+    user_name = get_active_user_name(get_active_gmail_user_id())
+    if user_name:
+        instructions = (
+            f"{instructions}\n\nUser name: {user_name}. Use this as the default sign-off "
+            "when drafting emails."
+        )
+
+    if _needs_email_search_instruction(agent_name, instructions):
+        instructions = (
+            f"{instructions}\n\nEmail retrieval instruction: Use task_email_search to find "
+            "the relevant email(s). If this is a follow-up without a new source, use the "
+            "most recent email from your history; otherwise use a fresh fuzzy query with "
+            "ORs (from:NAME OR subject:\"NAME\" OR \"NAME\"). Always pick the newest "
+            "message by timestamp."
+        )
 
     get_execution_agent_logs().record_request(agent_name, instructions)
 
@@ -150,10 +187,46 @@ def send_message_to_agent(agent_name: str, instructions: str) -> ToolResult:
     )
 
 
+def _needs_email_search_instruction(agent_name: str, instructions: str) -> bool:
+    text = f"{agent_name}\n{instructions}".lower()
+    if "task_email_search" in text or "gmail_fetch_emails" in text:
+        return False
+    triggers = [
+        "summarizer",
+        "summarize",
+        "summary",
+        "details",
+        "detail",
+        "explain",
+        "explanation",
+        "what's in it",
+        "what is in it",
+        "more info",
+        "more details",
+        "detailed",
+        "timeline",
+        "newsletter",
+        "latest",
+        "email",
+        "mail",
+        "inbox",
+        "ainews",
+        "swyx",
+    ]
+    return any(trigger in text for trigger in triggers)
+
+
 # Send immediate message to user and record in conversation history
 def send_message_to_user(message: str) -> ToolResult:
     """Record a user-visible reply in the conversation log."""
     log = get_conversation_log()
+    last_reply = _get_last_assistant_reply(log)
+    if last_reply and last_reply.strip() == message.strip():
+        return ToolResult(
+            success=True,
+            payload={"status": "deduped"},
+            recorded_reply=True,
+        )
     log.record_reply(message)
 
     return ToolResult(
@@ -173,18 +246,146 @@ def send_draft(
     """Record a draft update in the conversation log for the interaction agent."""
     log = get_conversation_log()
 
+    body = _apply_default_signoff(body)
     message = f"To: {to}\nSubject: {subject}\n\n{body}"
 
     log.record_reply(message)
     logger.info(f"Draft recorded for: {to}")
 
+    user_id = get_active_gmail_user_id()
+    if not user_id:
+        return ToolResult(
+            success=True,
+            payload={
+                "status": "draft_recorded",
+                "to": to,
+                "subject": subject,
+                "warning": "Gmail not connected",
+            },
+            recorded_reply=True,
+        )
+
+    latest = get_latest_draft(user_id) or {}
+    if (
+        latest.get("to") == to
+        and latest.get("subject") == subject
+        and latest.get("body") == body
+        and latest.get("draft_id")
+    ):
+        return ToolResult(
+            success=True,
+            payload={
+                "status": "draft_recorded",
+                "to": to,
+                "subject": subject,
+                "draft_id": latest.get("draft_id"),
+                "note": "Existing draft reused",
+            },
+            recorded_reply=True,
+        )
+
+    try:
+        result = execute_gmail_tool(
+            "GMAIL_CREATE_EMAIL_DRAFT",
+            user_id,
+            arguments={
+                "recipient_email": to,
+                "subject": subject,
+                "body": body,
+            },
+        )
+        draft_id = _extract_draft_id(result)
+        if draft_id:
+            set_latest_draft(user_id, draft_id, to=to, subject=subject, body=body)
+        return ToolResult(
+            success=True,
+            payload={
+                "status": "draft_recorded",
+                "to": to,
+                "subject": subject,
+                "draft_id": draft_id,
+            },
+            recorded_reply=True,
+        )
+    except Exception as exc:
+        return ToolResult(
+            success=True,
+            payload={
+                "status": "draft_recorded",
+                "to": to,
+                "subject": subject,
+                "warning": f"Failed to create Gmail draft: {exc}",
+            },
+            recorded_reply=True,
+        )
+
+
+def _extract_draft_id(payload: Any) -> Optional[str]:
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        for key in ("draft_id", "draftId", "id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for container_key in ("data", "result", "response_data", "draft"):
+            nested = payload.get(container_key)
+            if isinstance(nested, dict):
+                found = _extract_draft_id(nested)
+                if found:
+                    return found
+        items = payload.get("items")
+        if isinstance(items, list) and items:
+            for entry in items:
+                found = _extract_draft_id(entry)
+                if found:
+                    return found
+    return None
+
+
+def _apply_default_signoff(body: str) -> str:
+    user_name = get_active_user_name(get_active_gmail_user_id())
+    cleaned = (body or "").strip()
+    if not cleaned or not user_name:
+        return body
+
+    name_lower = user_name.lower()
+    tail = cleaned[-200:].lower()
+    if name_lower in tail:
+        return body
+
+    placeholder_pattern = re.compile(r"\[(your name)\]|\{your name\}|\(your name\)|<your name>", re.IGNORECASE)
+    if placeholder_pattern.search(cleaned):
+        return placeholder_pattern.sub(user_name, cleaned)
+
+    return f"{cleaned}\n\nBest,\n{user_name}"
+
+
+def send_latest_draft() -> ToolResult:
+    user_id = get_active_gmail_user_id()
+    draft = get_latest_draft(user_id)
+    draft_id = (draft or {}).get("draft_id")
+    if not user_id or not draft_id:
+        return ToolResult(
+            success=False,
+            payload={"error": "No draft available to send."},
+            user_message="I couldn't find a draft to send. Want me to create one?",
+        )
+
+    try:
+        result = execute_gmail_tool("GMAIL_SEND_DRAFT", user_id, arguments={"draft_id": draft_id})
+    except Exception as exc:
+        return ToolResult(
+            success=False,
+            payload={"error": str(exc)},
+            user_message="I couldn't send that draft. Want me to create a new one?",
+        )
+
+    clear_latest_draft(user_id)
     return ToolResult(
         success=True,
-        payload={
-            "status": "draft_recorded",
-            "to": to,
-            "subject": subject,
-        },
+        payload=result,
+        user_message="Sent it.",
         recorded_reply=True,
     )
 
@@ -216,13 +417,25 @@ def wait(reason: str) -> ToolResult:
 
 
 def _can_wait(log) -> bool:
-    """Return True only if the latest non-wait entry is a poke_reply."""
+    """Return True only if the latest non-wait entry is an assistant reply."""
     entries = list(log.iter_entries())
     for tag, _, _ in reversed(entries):
         if tag == "wait":
             continue
-        return tag == "poke_reply"
+        return tag in {"assistant_reply", "poke_reply"}
     return False
+
+
+def _get_last_assistant_reply(log) -> Optional[str]:
+    entries = list(log.iter_entries())
+    for tag, _, payload in reversed(entries):
+        if tag == "wait":
+            continue
+        if tag in {"assistant_reply", "poke_reply"}:
+            return payload
+        if tag == "user_message":
+            return None
+    return None
 
 
 # Return predefined tool schemas for LLM function calling
@@ -248,10 +461,12 @@ def handle_tool_call(name: str, arguments: Any) -> ToolResult:
             return send_message_to_user(**args)
         if name == "send_draft":
             return send_draft(**args)
+        if name == "send_latest_draft":
+            return send_latest_draft()
         if name == "wait":
             return wait(**args)
 
-        logger.warning("unexpected tool", extra={"tool": name})
+        logger.warning("unexpected tool: %s", name)
         return ToolResult(success=False, payload={"error": f"Unknown tool: {name}"})
     except json.JSONDecodeError:
         return ToolResult(success=False, payload={"error": "Invalid JSON"})
