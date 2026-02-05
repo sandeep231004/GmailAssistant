@@ -1,4 +1,4 @@
-# GmailAssistant
+﻿# GmailAssistant
 
 GmailAssistant is a full-stack Gmail automation assistant built around a FastAPI backend, a React/Vite frontend, and Composio for Gmail OAuth + tool execution. It lets users connect Gmail, chat with an LLM-powered assistant, draft emails, and receive inbox summaries.
 
